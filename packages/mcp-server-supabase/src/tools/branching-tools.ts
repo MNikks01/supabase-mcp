@@ -13,7 +13,8 @@ import { z } from 'zod/v4';
 import type { BranchingOperations } from '../platform/types.js';
 import { branchSchema } from '../platform/types.js';
 import { getBranchCost } from '../pricing.js';
-import { hashObject } from '../util.js';
+import type { CostConfirmationTokens } from './cost-confirmation-token.js';
+import type { ConfirmationReplayGuard } from './replay-guard.js';
 import {
   actionOnlyElicitationSchema,
   branchCostStateSchema,
@@ -40,7 +41,11 @@ type BranchingToolsOptions = {
    */
   confirmation?: {
     codec: RequestStateCodec<ElicitationState>;
+    /** Makes accepted confirmations single-use (supabase/mcp#318). */
+    replay?: { guard: ConfirmationReplayGuard; ttlMs: number };
   };
+  /** Mints and verifies legacy `confirm_cost` IDs (supabase/mcp#318). */
+  costTokens: CostConfirmationTokens;
 };
 
 const createBranchInputSchema = z.object({
@@ -191,6 +196,7 @@ export function getBranchingTools({
   projectId,
   readOnly,
   confirmation,
+  costTokens,
 }: BranchingToolsOptions) {
   const project_id = projectId;
 
@@ -254,6 +260,7 @@ export function getBranchingTools({
                   name,
                   cost,
                   issued_at: Date.now(),
+                  nonce: crypto.randomUUID(),
                 },
                 ctx
               ),
@@ -266,6 +273,7 @@ export function getBranchingTools({
             schema: branchCostStateSchema,
             receivedAt,
             requestKey: 'confirm_cost',
+            replay: confirmation.replay,
             askForConfirmation,
             observation,
             argsMatch: (state) =>
@@ -306,8 +314,7 @@ export function getBranchingTools({
           route: 'legacy',
           reason,
         });
-        const costHash = await hashObject(cost);
-        if (costHash !== confirm_cost_id) {
+        if (!(await costTokens.verify(confirm_cost_id, cost))) {
           throw new ToolCallerError(
             'Cost confirmation ID does not match the expected cost of creating a branch.',
             { kind: 'confirmation_required' }
