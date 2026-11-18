@@ -11,7 +11,7 @@ import {
 } from '@modelcontextprotocol/client';
 import { describe, expect, test, vi } from 'vitest';
 import * as pricing from './pricing.js';
-import { hashObject } from './util.js';
+import { createCostConfirmationTokens } from './tools/cost-confirmation-token.js';
 import { callModernTool } from '../test/server-harness.js';
 
 const { decision, required, validation, response, started, operationEnd } =
@@ -185,8 +185,18 @@ describe.each(tools)('%s observation', (name) => {
         name === 'create_project'
           ? { type: 'project', recurrence: 'monthly', amount: 10 }
           : pricing.getBranchCost();
+      // A real `confirm_cost` ID: same key/principal the server uses (the
+      // configured requestState, else the process-wide key).
+      const tokens = createCostConfirmationTokens(
+        options.configured
+          ? { key: 'a'.repeat(32), principal: 'PRIVATE_PRINCIPAL' }
+          : {}
+      );
       const result = await h.call(name, {
-        arguments: { ...h.args(name), confirm_cost_id: await hashObject(cost) },
+        arguments: {
+          ...h.args(name),
+          confirm_cost_id: await tokens.mint(cost),
+        },
       });
       expect((result as CallToolResult).isError).not.toBe(true);
       assertAttempt(

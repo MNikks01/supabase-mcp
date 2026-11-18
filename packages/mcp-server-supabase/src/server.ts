@@ -1,3 +1,8 @@
+import { createCostConfirmationTokens } from './tools/cost-confirmation-token.js';
+import {
+  type ConfirmationReplayGuard,
+  defaultReplayGuard,
+} from './tools/replay-guard.js';
 import {
   CLIENT_INFO_META_KEY,
   createRequestStateCodec,
@@ -137,6 +142,13 @@ export type SupabaseMcpServerOptions = {
       enabledTools: readonly ElicitationToolName[];
       /** How long a confirmation `requestState` stays valid, in seconds. Defaults to 600. */
       ttlSeconds?: number;
+      /**
+       * Makes accepted cost confirmations single-use (supabase/mcp#318).
+       * Defaults to an in-process guard; multi-instance deployments MUST pass
+       * a shared one (e.g. Redis `SET NX PXAT`), or replays that land on
+       * another instance still go through.
+       */
+      replayGuard?: ConfirmationReplayGuard;
     };
     /**
      * URL-mode secret collection for `create_edge_function_secret`. Requires
@@ -253,6 +265,18 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
           ttlSeconds: secretCollectionTtlSeconds,
         })
       : undefined;
+  // Legacy `confirm_cost` IDs: HMAC under the requestState key when one is
+  // configured (works across instances), else a process-wide random key.
+  const costTokens = createCostConfirmationTokens({
+    key: elicitation?.requestState.key,
+    principal: elicitation?.requestState.principal,
+    ttlSeconds: confirmationTtlSeconds,
+  });
+  const replay = {
+    guard: elicitation?.confirmation?.replayGuard ?? defaultReplayGuard,
+    ttlMs: confirmationTtlSeconds * 1000,
+  };
+
   // Both codecs share the HMAC key and binding. The SDK verifies each token's
   // signed expiry; a codec's configured TTL only affects tokens it mints.
   const verificationCodec = confirmationCodec ?? secretCollectionCodec;
@@ -336,8 +360,9 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
             confirmation:
               confirmationCodec &&
               enabledConfirmationTools.includes('create_project')
-                ? { codec: confirmationCodec }
+                ? { codec: confirmationCodec, replay }
                 : undefined,
+            costTokens,
           })
         );
       }
@@ -390,8 +415,9 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
             confirmation:
               confirmationCodec &&
               enabledConfirmationTools.includes('create_branch')
-                ? { codec: confirmationCodec }
+                ? { codec: confirmationCodec, replay }
                 : undefined,
+            costTokens,
           })
         );
       }

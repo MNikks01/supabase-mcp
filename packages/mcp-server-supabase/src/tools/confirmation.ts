@@ -11,6 +11,7 @@ import type { ConfirmationFeature, ObservationFact } from '../observation.js';
 import { z } from 'zod/v4';
 import type { BranchCost, Cost } from '../pricing.js';
 import { AWS_REGION_CODES } from '../regions.js';
+import type { ConfirmationReplayGuard } from './replay-guard.js';
 
 /** `confirm_cost_id` description for clients that must call `confirm_cost`. */
 export const confirmCostIdDescription =
@@ -41,6 +42,13 @@ type IssuedAt = number;
 const issuedAtSchema = z.number().optional();
 
 /**
+ * Random per-mint ID consumed once on accept (supabase/mcp#318). Optional in
+ * the schema only so states minted before it existed parse; they are
+ * re-prompted instead of honored.
+ */
+const nonceSchema = z.string().optional();
+
+/**
  * Signed `requestState` payload for the `create_project` cost-confirmation
  * elicitation, bound to the project arguments and the cost quoted to the
  * user.
@@ -52,6 +60,7 @@ export type ProjectCostState = {
   organization_id: string;
   cost: Cost;
   issued_at?: IssuedAt;
+  nonce?: string;
 };
 
 const costSchema: z.ZodType<Cost> = z.discriminatedUnion('type', [
@@ -74,6 +83,7 @@ export const projectCostStateSchema = z.object({
   organization_id: z.string(),
   cost: costSchema,
   issued_at: issuedAtSchema,
+  nonce: nonceSchema,
 }) satisfies z.ZodType<ProjectCostState>;
 
 /**
@@ -87,6 +97,7 @@ export type BranchCostState = {
   name: string;
   cost: BranchCost;
   issued_at?: IssuedAt;
+  nonce?: string;
 };
 
 export const branchCostStateSchema = z.object({
@@ -99,6 +110,7 @@ export const branchCostStateSchema = z.object({
     amount: z.number(),
   }),
   issued_at: issuedAtSchema,
+  nonce: nonceSchema,
 }) satisfies z.ZodType<BranchCostState>;
 
 export type ExecuteSqlState = {
@@ -220,9 +232,18 @@ export type ConfirmationStateOptions<S extends ConfirmationState> = {
    */
   receivedAt: number;
   observation?: ToolObservation<ObservationFact>;
+  /**
+   * Makes an accepted state single-use. Only states that carry a `nonce` can
+   * proceed; the nonce is consumed right before the tool's side effect.
+   */
+  replay?: { guard: ConfirmationReplayGuard; ttlMs: number };
 };
 
-type RepromptReason = 'initial' | 'missing_response' | 'changed_quote';
+type RepromptReason =
+  | 'initial'
+  | 'missing_response'
+  | 'changed_quote'
+  | 'missing_nonce';
 
 const OUTCOME = {
   accept: 'completed',
@@ -319,7 +340,10 @@ export async function checkConfirmationState<S extends ConfirmationState>(
       | { kind: 'terminal' }
     )
 > {
-  const decision = inspectConfirmationState(options);
+  const decision = await consumeOnce(
+    options,
+    inspectConfirmationState(options)
+  );
   if (decision.kind !== 'reprompt') {
     return decision;
   }
@@ -331,6 +355,46 @@ export async function checkConfirmationState<S extends ConfirmationState>(
     reason: decision.reason,
   });
   return { kind: 'reprompt', result };
+}
+
+/**
+ * Consumes a proceeding state's nonce (supabase/mcp#318). Runs after every
+ * other check, so declined, cancelled or mismatched resumes never burn it.
+ * A side effect that later fails still burns it: the user confirms again,
+ * which is cheaper than allowing a second billable create.
+ */
+async function consumeOnce<S extends ConfirmationState>(
+  options: ConfirmationStateOptions<S>,
+  decision: ConfirmationDecision<S>
+): Promise<ConfirmationDecision<S>> {
+  const { replay, tool, observation, receivedAt } = options;
+  if (!replay || decision.kind !== 'proceed') {
+    return decision;
+  }
+  const { nonce, issued_at } = decision.state as {
+    nonce?: string;
+    issued_at?: number;
+  };
+  if (!nonce) {
+    return { kind: 'reprompt', reason: 'missing_nonce' };
+  }
+  const expiresAtMs = (issued_at ?? receivedAt) + replay.ttlMs;
+  if (await replay.guard.consume(`${tool}:${nonce}`, expiresAtMs)) {
+    return decision;
+  }
+  observation?.record({
+    kind: 'resume_validation',
+    feature: FEATURE[tool],
+    result: 'replayed',
+  });
+  return {
+    kind: 'terminal',
+    result: terminalResult(
+      'error',
+      `This confirmation was already used. Call \`${tool}\` again to get a new confirmation.`,
+      true
+    ),
+  };
 }
 
 /** Inspect SDK-verified state without issuing a new confirmation. */

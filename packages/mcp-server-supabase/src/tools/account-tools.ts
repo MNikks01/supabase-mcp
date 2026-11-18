@@ -27,7 +27,8 @@ import type { AccountOperations } from '../platform/types.js';
 import { organizationSchema, projectSchema } from '../platform/types.js';
 import { getBranchCost, getNextProjectCost } from '../pricing.js';
 import { AWS_REGION_CODES } from '../regions.js';
-import { hashObject } from '../util.js';
+import type { CostConfirmationTokens } from './cost-confirmation-token.js';
+import type { ConfirmationReplayGuard } from './replay-guard.js';
 
 type AccountToolsOptions = {
   account: AccountOperations;
@@ -40,7 +41,11 @@ type AccountToolsOptions = {
    */
   confirmation?: {
     codec: RequestStateCodec<ElicitationState>;
+    /** Makes accepted confirmations single-use (supabase/mcp#318). */
+    replay?: { guard: ConfirmationReplayGuard; ttlMs: number };
   };
+  /** Mints and verifies legacy `confirm_cost` IDs (supabase/mcp#318). */
+  costTokens: CostConfirmationTokens;
 };
 
 const listOrganizationsInputSchema = z.object({});
@@ -257,6 +262,7 @@ export function getAccountTools({
   account,
   readOnly,
   confirmation,
+  costTokens,
 }: AccountToolsOptions) {
   return {
     list_organizations: tool({
@@ -299,7 +305,7 @@ export function getAccountTools({
     confirm_cost: tool({
       ...accountToolDefs.confirm_cost,
       execute: async (cost) => {
-        return { confirmation_id: await hashObject(cost) };
+        return { confirmation_id: await costTokens.mint(cost) };
       },
     }),
     create_project: tool({
@@ -376,6 +382,7 @@ export function getAccountTools({
                   organization_id,
                   cost,
                   issued_at: Date.now(),
+                  nonce: crypto.randomUUID(),
                 },
                 ctx
               ),
@@ -388,6 +395,7 @@ export function getAccountTools({
             schema: projectCostStateSchema,
             receivedAt,
             requestKey: 'confirm_cost',
+            replay: confirmation.replay,
             askForConfirmation,
             observation,
             argsMatch: (state) =>
@@ -433,8 +441,7 @@ export function getAccountTools({
           route: 'legacy',
           reason,
         });
-        const costHash = await hashObject(cost);
-        if (costHash !== confirm_cost_id) {
+        if (!(await costTokens.verify(confirm_cost_id, cost))) {
           throw new ToolCallerError(
             'Cost confirmation ID does not match the expected cost of creating a project.',
             { kind: 'confirmation_required' }

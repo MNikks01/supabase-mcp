@@ -46,7 +46,11 @@ export type ObservationFact =
       kind: 'input_required';
       feature: ConfirmationFeature;
       mode: 'form';
-      reason: 'initial' | 'missing_response' | 'changed_quote';
+      reason:
+        | 'initial'
+        | 'missing_response'
+        | 'changed_quote'
+        | 'missing_nonce';
     }>
   | Readonly<{
       kind: 'input_response';
@@ -66,7 +70,8 @@ export type ObservationFact =
         | 'tool_mismatch'
         | 'arguments_mismatch'
         | 'changed_quote'
-        | 'expired';
+        | 'expired'
+        | 'replayed';
     }>
   | Readonly<{
       kind: 'operation';
